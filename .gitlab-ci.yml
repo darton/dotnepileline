@@ -1,0 +1,146 @@
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  KESTREL_PROCES: "my-worker"
+  APP_PATH: "/srv/MyWorker"
+  APP_PATH_OLD: "/srv/MyWorker.Old"
+  APP_SETTINGS_FILE: "appsettings.Production.json"
+  APP_SETTINGS_DEV_FILE: "appsettings.Development.json"
+  APP_SETTINGS_DIR: "/opt/etc/MyWorker"
+  PUBLISH_PATH: ".publish"
+  DOTNET_PROJECT: "MyWorker/MyWorker.csproj"
+  SYSTEMD_SCRIPT: "my-worker.service"
+  BRANCH_DEV_NAME: "devel"
+  BRANCH_PROD_NAME: "master"
+  RUNNER_DEV_TAG: "myworker-dev"
+  RUNNER_PROD_TAG: "myworker-prod"
+ 
+.dotnet-install: &dotnet-install
+  - 'which dotnet>/dev/null || wget https://packages.microsoft.com/config/debian/11/packages-microsoft-prod.deb -O /tmp/packages-microsoft-prod.deb'
+  - '[[ -f /tmp/packages-microsoft-prod.deb ]] && sudo dpkg -i /tmp/packages-microsoft-prod.deb && sudo apt update && sudo apt install -y apt-transport-https && sudo apt-get install -y dotnet-sdk-6.0'
+ 
+.archive-app: &archive-app
+  - '[[ -d "$APP_PATH" ]] && sudo mv "$APP_PATH" "${APP_PATH_OLD}-$(date +%s)"'
+  - '[[ $(ls -1 /srv|grep $(basename $APP_PATH_OLD)|wc -l) -gt 2 ]] && ls -1tr /srv|grep $(basename $APP_PATH_OLD)|head -n 1|xargs -0 -I dirname echo "rm -fR /srv/"dirname|sudo bash'
+ 
+.stop-kestrel-process: &stop-kestrel-process
+  - 'sudo systemctl -q is-active "$KESTREL_PROCES"  && sudo systemctl stop "$KESTREL_PROCES"'
+ 
+.run-kestrel-process: &run-kestrel-process
+  - 'sudo systemctl -q is-enabled "$KESTREL_PROCES" || sudo systemctl enable "$KESTREL_PROCES"'
+  - 'sudo systemctl -q is-active "$KESTREL_PROCES" || sudo systemctl start "$KESTREL_PROCES" && sudo systemctl restart "$KESTREL_PROCES"'
+  - 'sudo systemctl status "$KESTREL_PROCES"'
+ 
+.deploy-startup-file: &deploy-startup-file
+  - 'sudo cp $SYSTEMD_SCRIPT /lib/systemd/system'
+  - 'if [[ $CI_COMMIT_REF_NAME == $BRANCH_DEV_NAME ]]; then sudo sed -i s/Production/Development/ /lib/systemd/system/"$SYSTEMD_SCRIPT"; fi'
+  - 'sudo systemctl daemon-reload'
+ 
+.publish-app: &publish-app
+  - '[[ -d "$APP_PATH" ]] || sudo mkdir -p "$APP_PATH"'
+  - 'sudo cp -R "$PUBLISH_PATH"/* "$APP_PATH"'
+  - 'sudo rm -R -f $PUBLISH_PATH'
+ 
+.deploy-appsettings: &deploy-appsettings
+  - 'if [[ $CI_COMMIT_REF_NAME == $BRANCH_DEV_NAME ]]; then sudo cp "$APP_SETTINGS_DIR"/"$APP_SETTINGS_DEV_FILE" "$APP_PATH"/"$APP_SETTINGS_DEV_FILE"; fi'
+  - 'if [[ $CI_COMMIT_REF_NAME == $BRANCH_PROD_NAME ]]; then sudo cp "$APP_SETTINGS_DIR"/"$APP_SETTINGS_FILE" "$APP_PATH"/"$APP_SETTINGS_FILE"; fi'
+  - 'sudo chown dotnet:dotnet "$APP_PATH" -R'
+ 
+ 
+stages:
+  - build
+  - test
+  - deploy
+ 
+include:
+  - template: Code-Quality.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+ 
+code_quality:
+  stage: test
+  tags:
+    - docker-alpine
+  artifacts:
+    paths: [gl-code-quality-report.json]
+    #when: always
+ 
+secret_detection:
+  stage: test
+  tags:
+    - docker-alpine
+  variables:
+    SECRET_DETECTION_HISTORIC_SCAN: "false"
+ 
+build_dev:
+  stage: build
+  variables:
+      GIT_SUBMODULE_STRATEGY: recursive
+  tags:
+    - $RUNNER_DEV_TAG
+  before_script:
+    - *dotnet-install
+    - 'dotnet restore'
+  script:
+    - 'dotnet publish "$DOTNET_PROJECT" -c Debug -o $PUBLISH_PATH --self-contained false'
+  artifacts:
+    paths:
+      - $PUBLISH_PATH
+    expire_in: '1 hrs'
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == $BRANCH_DEV_NAME'
+ 
+deploy_dev:
+  stage: deploy
+  tags:
+    - $RUNNER_DEV_TAG
+  script:
+    - *deploy-startup-file
+    - *stop-kestrel-process
+    - *archive-app
+    - *publish-app
+    - *deploy-appsettings
+    - *run-kestrel-process
+  needs: [secret_detection, code_quality, build_dev]
+  #when: manual
+  dependencies:
+    - build_dev
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == $BRANCH_DEV_NAME'
+ 
+build_prod:
+  stage: build
+  variables:
+      GIT_SUBMODULE_STRATEGY: recursive
+  tags:
+    - $RUNNER_PROD_TAG
+  before_script:
+    - *dotnet-install
+    - 'dotnet restore'
+  script:
+    - 'dotnet publish "$DOTNET_PROJECT" -c Release -o $PUBLISH_PATH --self-contained false'
+  artifacts:
+    paths:
+      - $PUBLISH_PATH
+    expire_in: '1 hrs'
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == $BRANCH_PROD_NAME'
+ 
+deploy_prod:
+  stage: deploy
+  tags:
+    - $RUNNER_PROD_TAG
+  script:
+    - *deploy-startup-file
+    - *stop-kestrel-process
+    - *archive-app
+    - *publish-app
+    - *deploy-appsettings
+    - *run-kestrel-process
+  #only:
+  #  - $BRANCH_PROD_NAME
+  needs: [code_quality, secret_detection, build_prod]
+  when: manual
+  dependencies:
+    - build_prod
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == $BRANCH_PROD_NAME'
